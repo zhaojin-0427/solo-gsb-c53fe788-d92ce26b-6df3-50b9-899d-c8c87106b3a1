@@ -1,0 +1,56 @@
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: keyvault
+      POSTGRES_PASSWORD: keyvault
+      POSTGRES_DB: keyvault
+    ports:
+      - "5432:5432"
+    volumes:
+      - keyvault_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U keyvault"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  api:
+    build: .
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      KEYVAULT_DATABASE_URL: postgresql://keyvault:keyvault@db:5432/keyvault
+      # 生产环境务必替换：32 字节字符串或 64 位 hex
+      KEYVAULT_SHARD_MASTER_KEY: dev-only-shard-master-key-32bytes
+      KEYVAULT_ADMIN_API_KEY: admin-dev-key
+    ports:
+      - "8000:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health').status==200 else 1)"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  # 一键跑完整验收（并发回滚竞态回归 + 迁移缺片故障转移回归 + 迁移创建并发
+  # 幂等回归 + 谱系逻辑销毁回归 + 正常恢复 + 各类拒绝依据 + 并发重放 +
+  # 跨策略密钥迁移 + 审计重放）：
+  #   docker compose --profile demo run --rm demo
+  demo:
+    build: .
+    profiles: ["demo"]
+    depends_on:
+      api:
+        condition: service_healthy
+    environment:
+      KEYVAULT_BASE_URL: http://api:8000
+      # 竞态回归脚本以进程内 ASGI 方式自带应用，直连同一个数据库，
+      # 仅在该一次性验收容器内开启故障注入闸门（API 服务本身保持关闭）。
+      KEYVAULT_DATABASE_URL: postgresql://keyvault:keyvault@db:5432/keyvault
+      KEYVAULT_FAULT_INJECTION: "1"
+    entrypoint: ["/run_demo.sh"]
+    restart: "no"
+
+volumes:
+  keyvault_pgdata:
