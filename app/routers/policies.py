@@ -124,6 +124,19 @@ async def rotate_policy(policy_id: str, body: RotateIn, request: Request, tenant
             await conn.execute("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", policy_id)
             head = await _load_owned_active_head(conn, tenant["id"], policy_id, body.expected_version)
 
+            # 全局行锁序：custody 行先于 policy 行。先按 id 序锁定该旧版本下的
+            # 全部 custody 行（含非 active 的，保证锁集是迁移创建源锁的超集），
+            # 随后才 UPDATE policy 版本行——与迁移创建（源 custody 行锁 → 源/
+            # 目标 policy 版本行 FOR UPDATE）及销毁/提交路径的加锁顺序完全一致。
+            # 否则 rotate 持 policy 行锁等 custody、而并发迁移创建持 custody 等
+            # policy 行锁会形成锁序反转死锁；统一顺序后“策略撤销 × 重建插入”
+            # 必有确定性先后：谁先持锁谁决定。
+            await conn.fetch(
+                "SELECT id FROM key_custodies "
+                "WHERE policy_id=$1 AND policy_version=$2 ORDER BY id FOR UPDATE",
+                policy_id, head["current_version"],
+            )
+
             custodian_ids = body.custodian_ids if body.custodian_ids is not None else list(head["custodian_ids"])
             threshold = body.threshold if body.threshold is not None else head["threshold"]
             if not 1 <= threshold <= len(custodian_ids):
@@ -184,6 +197,14 @@ async def revoke_epoch(policy_id: str, body: RevokeEpochIn, request: Request, te
         async with conn.transaction():
             await conn.execute("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", policy_id)
             head = await _load_owned_active_head(conn, tenant["id"], policy_id, body.expected_version)
+            # 全局行锁序（custody 先于 policy）：先锁定该版本下的全部 custody
+            # 行再置 policy 行为 revoked，与迁移创建/轮换同一加锁顺序，杜绝
+            # “目标撤销 × 迁移（重建）插入”的锁序反转死锁，先后确定。
+            await conn.fetch(
+                "SELECT id FROM key_custodies "
+                "WHERE policy_id=$1 AND policy_version=$2 ORDER BY id FOR UPDATE",
+                policy_id, head["current_version"],
+            )
             await conn.execute(
                 "UPDATE policies SET status='revoked' WHERE id=$1 AND version=$2",
                 policy_id, head["current_version"],

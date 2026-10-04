@@ -45,6 +45,27 @@ v1.4 新增**跨策略密钥迁移**：租户对仍有效的托管记录指定�
 > 另一次稳定 409）、D9b（同键同根并发重试得同一回执）、D9c（双闸门同时放行，
 > 结果集合恒为 {201, 409}）、D9d（通用故障仍是 500，不误判为幂等冲突）。
 
+> **修复要点（v1.7.2）**：修复 `POST /migrations` 终态重试**沿用旧策略与旧摘要**的问题。
+> 同租户两条有效源以同一 `Idempotency-Key` 并发创建时，败方 INSERT 撞
+> `uq_migration_idem_open`，savepoint 回滚后进入“等待—重读”；这期间胜方会话可能由
+> `open` 转 **`failed`**（源门限提交后缺片），其**目标策略版本也可能恰被撤销或 epoch
+> 到期**。旧实现在重建时复用了**事务开始时**的非锁校验结果、旧 `now()` 与旧目标摘要，
+> 可能为已失效目标再插一个 `open` 会话。现改为：
+> ① **每次尝试都在同一个 savepoint 内**重新核对——对源 custody 行与源/目标不可变策略版本
+> 行按规范顺序取 `FOR UPDATE`（custody 先于 policy 的全局锁序；轮换/撤销也先锁 custody
+> 再改 policy），savepoint 因唯一冲突回滚时这些策略行锁一并释放，等待期间败方只持源
+> custody 锁，与目标撤销的真实事务不死锁、先后确定；② epoch 有效期一律用核对时刻新取的
+> **`clock_timestamp()`** 判定，等待中到期绝不以事务开始时的旧时间放行；③ 目标失效确定性
+> 返回 **409 `MIGRATION_TARGET_INVALID`**（源失效为 `MIGRATION_SOURCE_INVALID`），随
+> savepoint 回滚——**不留下会话、不留成功审计**，由独立事务单独记一条
+> `migration.start` denied 审计；源/目标都仍有效才用新的 `valid_until` 新建 open 会话；
+> ④ 重建 INSERT 前再按与幂等重放一致的存活判定裁决——等待期间出现的**新赢家**：同请求
+> **200 重放**、异请求 **409 `IDEMPOTENCY_CONFLICT`**、赢家已 **completed 仍可重放**
+> （completed 不占 open 索引，必须显式判出，不能靠 INSERT 碰运气）；非目标约束 23505 与
+> 其它数据库错误**原样上抛、绝不误判**。回归验证见 `scripts/race_migration_start.py`
+> 新增 S9–S14（可控交错：`migration.before_rebuild_revalidate` /
+> `migration.before_rebuild_insert` 两个仅测试构建启用的闸门）。
+>
 > **修复要点（v1.7.1）**：修复 `POST /migrations` 并发创建兜底里的**已完成赢家漏判**。
 > 同一租户用同一 `Idempotency-Key` 对两条不同且有效的源记录并发创建时，败方 INSERT 撞
 > `uq_migration_idem_open`、savepoint 回滚后需要**重读已提交的胜方会话**来裁决；但胜方会话
@@ -187,7 +208,7 @@ docker compose exec api python -m app.seed
 ```bash
 # 1) 并发回滚竞态回归（scripts.race_recovery，38 项）
 # 2) 迁移缺片故障转移回归（scripts.race_migration，37 项）
-# 3) 迁移创建并发幂等回归（scripts.race_migration_start，S1–S8）
+# 3) 迁移创建并发幂等回归（scripts.race_migration_start，S1–S14）
 # 4) 谱系逻辑销毁回归（scripts.race_destruction，D1–D9）
 # 5) 端到端验收（scripts.demo，含销毁全流程）
 docker compose --profile demo run --rm demo
@@ -217,7 +238,17 @@ docker compose --profile demo run --rm demo
 钉在**保存点回滚后、重读已提交胜方之前**（S7/S8）：S7 期间胜方被真实托管人提交驱动
 `open→completed`，败方重读仍按源记录+目标策略版本判出已提交赢家——稳定 409 且只留拒绝审计，
 绝不冒出 500；S8 期间胜方转入 `failed` 终态，终态行不充当赢家，败方按终态后重建规则 201 建成
-自己的会话。
+自己的会话。S9–S14 进一步钉住**终态后重建沿用旧策略/旧时间**的交错（v1.7.2 修复）：
+`migration.before_rebuild_revalidate` 闸门把败方钉在 savepoint 已回滚、重新核对源/目标之前
+（此时只持源 custody 锁、不持 policy 行锁），`migration.before_rebuild_insert` 闸门把败方钉在
+重新核对通过、INSERT 之前——S9 等待期间真实撤销败方**目标**策略版本 → 重建确定性
+`MIGRATION_TARGET_INVALID`、不留会话/成功审计、只留一条独立拒绝审计，另配有效目标后可干净发起；
+S10 等待期间目标 **epoch 到期**（以核对时刻新取的 `clock_timestamp()` 判定，绝不以事务开始的旧
+`now()` 放行）→ 同样拒绝；S11/S11b 覆盖等待期间**源**被撤销/源 epoch 到期 →
+`MIGRATION_SOURCE_INVALID`；S12/S13 在重建 INSERT 前让**新赢家**用同键提交，甚至驱动到
+`completed`——重建 INSERT 前按存活判定（open/completed 均为有效赢家）裁决，异请求稳定 409、
+同请求 200 重放（含已完成态与同一新 custody），绝不为 completed 赢家再建同键 open 会话；
+S14 在重建 INSERT 点注入通用故障与非目标 23505，一律原样 500、不误判，回滚后同键干净重试。
 `scripts.race_destruction.py` 钉住**逻辑销毁 × 迁移完成/分片领取/份额提交**的行锁交错
 （销毁在持谱系 custody 锁、会话锁前 park，使在途请求排队）：断言先后确定、输掉交错的旧会话
 只得到 `CUSTODY_DESTROYED`（不再下发分片/密文、不产生漏删后代）、迁移先赢时新后代必被纳入
@@ -512,7 +543,19 @@ curl -s localhost:8000/migrations/mig_2933ebd24b57824c53eca9b7 -H "X-API-Key: $T
     （reason=`concurrent_open_with_same_idempotency_key`，basis 带胜方 `migration_id`）；
     即使胜方在重读前刚由 `open` 转 `completed` 也同样判出，**绝不冒出 500**；败方不留下
     会话/成功审计，单独补拒绝审计，换新键可重试。若撞索引的行已转入终态（键位释放），
-    败方按**终态后重建规则**重新校验创建（有界重试 INSERT）；
+    败方按**终态后重建规则**处理（见下一条）；
+  - **终态后重建（v1.7.2）**：胜方转入 `expired`/`failed`/`destroyed` 后键位释放，败方**不复用**
+    等待前的旧校验结果/旧摘要/旧时间，而是在**同一个 savepoint 内**（① 唯一冲突回滚会把该
+    savepoint 内取的源/目标 policy `FOR UPDATE` 行锁一并释放，等待期间败方只持外层源 custody
+    锁，与目标撤销的真实事务按 custody→policy 全局锁序决出确定先后、不死锁）重新核对源 custody
+    与源/目标不可变策略版本，有效期一律以核对时刻新取的 **`clock_timestamp()`** 判定——等待中
+    epoch 到期也绝不放行；**目标失效 → 409 `MIGRATION_TARGET_INVALID`、源失效 → 409
+    `MIGRATION_SOURCE_INVALID`**，随 savepoint 回滚（**不留下会话、不留成功审计**），由独立事务
+    单独补一条 `migration.start` denied 审计；源/目标都仍有效才用新的 `valid_until` 新建 open
+    会话（有界重试）。重建 INSERT 前再按与幂等重放一致的存活判定裁决等待期间出现的**新赢家**
+    （`open`/`completed` 均有效，终态行不占位）：同请求 **200 重放**（含已完成态/同一新 custody）、
+    异请求 409 `IDEMPOTENCY_CONFLICT`——completed 赢家不占 open 索引，必须显式判出而不是靠 INSERT
+    碰运气，绝不重建出同键第二个 open 会话；
   - 不同键同源并发：排队者预查命中在途会话，返回 409 `MIGRATION_CONFLICT`
     （`open_migration_exists_for_custody`；已完成则 `custody_already_migrated`）；
   - 非目标约束的 23505（如主键冲突）或其它数据库错误**原样上抛为 500，绝不误判**为冲突。
@@ -805,7 +848,7 @@ uvicorn app.main:app --reload --port 8000
 KEYVAULT_BASE_URL=http://localhost:8000 python -m scripts.demo       # 端到端验收（含跨策略迁移与谱系销毁）
 KEYVAULT_FAULT_INJECTION=1 python -m scripts.race_recovery           # 并发回滚竞态回归（38 项）
 KEYVAULT_FAULT_INJECTION=1 python -m scripts.race_migration          # 迁移缺片故障转移回归（37 项）
-KEYVAULT_FAULT_INJECTION=1 python -m scripts.race_migration_start    # 迁移创建并发幂等回归（S1–S8）
+KEYVAULT_FAULT_INJECTION=1 python -m scripts.race_migration_start    # 迁移创建并发幂等回归（S1–S14）
 KEYVAULT_FAULT_INJECTION=1 python -m scripts.race_destruction        # 谱系逻辑销毁并发回归（D1–D9）
 ```
 

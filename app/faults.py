@@ -77,6 +77,23 @@ Migration-session creation (v1.7, ``scripts.race_migration_start.py``) adds:
   (``expired``/``failed``/``destroyed``) must not win — the creation is
   re-validated under the post-terminal rebuild rules instead of leaking the
   raw database exception.
+* ``migration.before_rebuild_revalidate`` — on the bounded rebuild retry
+  (post-terminal winner), after the savepoint rolled back and the conflict
+  re-read chose rebuild, but **before** source/target are re-locked and
+  revalidated. At this point the request holds only the outer source-custody
+  row lock (the policy ``FOR UPDATE`` locks lived inside the rolled-back
+  savepoint), so pinning here lets a real target-policy revoke / epoch expiry
+  commit first and proves the rebuild rejects with a fresh
+  ``clock_timestamp()`` instead of reusing the stale pre-wait policy/time.
+* ``migration.before_rebuild_insert`` — on the rebuild retry, after
+  revalidation + live-winner/source-blocker checks pass but before the INSERT.
+  Pinning here lets a *fresh* open/completed winner appear (or be completed)
+  under the same key, and ``X-Fault-Fail`` here injects a rebuild-INSERT
+  generic / non-target-23505 failure that must surface as a raw 500.
+
+Each gate is a fresh reached/release event pair per park cycle, so a request
+that lists several sequentially-visited gates cannot have one release fall
+through into a later listed gate.
 
 Header protocol (only honored when fault injection is enabled):
 
@@ -104,38 +121,75 @@ from .errors import ApiError, E_INTEGRITY
 
 @dataclass
 class _Gate:
+    # A fresh ``reached`` event per park cycle. ``park`` publishes a new event
+    # (signaling the harness) and waits on a paired ``release`` event; the harness
+    # waits on the current reached event and sets the release event. Because each
+    # cycle uses brand-new events, a release can never fall through into a later
+    # gate that merely shares the request's gate list.
     reached: asyncio.Event = field(default_factory=asyncio.Event)
     release: asyncio.Event = field(default_factory=asyncio.Event)
 
 
 class FaultBoard:
-    """Per-process gate registry; one gate per (name, token) pair."""
+    """Per-process gate registry; one gate per (name, token) pair.
+
+    Gates are **reusable across park/release cycles**, and a request may list
+    several gates visited sequentially (e.g. the migration creation loser parks
+    at ``after_insert_conflict``, is released, rebuilds, then parks at
+    ``before_rebuild_revalidate`` / ``before_rebuild_insert``). Every park
+    publishes a *fresh* reached/release event pair under the gate lock, so each
+    reached→release handshake is independent: a release at one cycle can never
+    fall through into a later gate that merely happens to be listed by the same
+    request.
+    """
 
     def __init__(self) -> None:
         self._gates: dict[str, _Gate] = {}
         self._lock = asyncio.Lock()
 
     async def _gate(self, key: str) -> _Gate:
-        async with self._lock:
-            gate = self._gates.get(key)
-            if gate is None:
-                gate = _Gate()
-                self._gates[key] = gate
-            return gate
+        """Return the gate for ``key``, creating it on first use.
+
+        The caller must already hold ``self._lock``.
+        """
+        gate = self._gates.get(key)
+        if gate is None:
+            gate = _Gate()
+            self._gates[key] = gate
+        return gate
 
     async def wait_reached(self, key: str, timeout: float = 10.0) -> None:
-        gate = await self._gate(key)
-        await asyncio.wait_for(gate.reached.wait(), timeout=timeout)
+        """Wait until the next park cycle at ``key`` signals reached.
+
+        The harness always calls this before releasing that cycle, so it may run
+        either after the coroutine parked (the current reached event is already
+        set → returns at once) or before (it waits on that same current event).
+        """
+        async with self._lock:
+            gate = await self._gate(key)
+            event = gate.reached
+        await asyncio.wait_for(event.wait(), timeout=timeout)
 
     async def release_gate(self, key: str) -> None:
-        gate = await self._gate(key)
-        gate.release.set()
+        """Release the park cycle currently parked at ``key`` and arm a fresh pair."""
+        async with self._lock:
+            gate = self._gates[key]
+            gate.release.set()
+            # Arm the next cycle with brand-new events, so the following park() blocks
+            # independently (a release can never satisfy a later, still-listed gate).
+            gate.reached = asyncio.Event()
+            gate.release = asyncio.Event()
 
     async def park(self, key: str, timeout: float = 30.0) -> None:
-        """Block at gate ``key`` until :meth:`release_gate` is called."""
-        gate = await self._gate(key)
-        gate.reached.set()
-        await asyncio.wait_for(gate.release.wait(), timeout=timeout)
+        """Block at gate ``key`` until :meth:`release_gate` releases this cycle."""
+        async with self._lock:
+            gate = await self._gate(key)  # creates the gate on first park
+            reached = gate.reached
+            release = gate.release
+            reached.set()
+        # Wait on the events captured for THIS cycle; a concurrent release_gate
+        # rotates gate.reached/release but cannot affect these captured objects.
+        await asyncio.wait_for(release.wait(), timeout=timeout)
 
 
 def enabled(request: Request) -> bool:
