@@ -47,6 +47,47 @@ Expected behavior after the fix (v1.7):
       rows never act as the winner: the loser's creation is re-validated
       under the post-terminal rebuild rules and succeeds with its own 201
       session — the key placeholder is free again.
+
+Post-terminal rebuild re-adjudication (v1.7.2):
+
+  S9  while the loser is parked after the savepoint rollback the winner goes
+      ``open`` → ``failed`` AND the TARGET policy version is revoked (the
+      target is neither request's source, so neither source row lock blocks
+      the revoke). The old rebuild reused the pre-wait policy rows/digests and
+      still created an open session pinned to the now-revoked target. The
+      rebuild must instead re-read the target version row (FOR UPDATE), fail
+      deterministically with 409 MIGRATION_TARGET_INVALID, leave NO session
+      and NO success audit, and record exactly one separate
+      ``migration.start`` / ``denied`` / MIGRATION_TARGET_INVALID audit.
+  S10 the TARGET epoch window expires (wall clock) while the loser is parked:
+      a decision must use a fresh ``clock_timestamp()`` — never the
+      transaction-start time frozen while the request waited on a lock — so
+      the rebuild fails with MIGRATION_TARGET_INVALID
+      (``target_epoch_expired``), no session is left, and a fresh key right
+      afterwards still hits the same deterministic rejection.
+  S11 the SOURCE epoch window expires while the loser is parked: the rebuild
+      re-reads the source custody/policy and fails with
+      MIGRATION_SOURCE_INVALID (``source_epoch_expired``), leaving no session
+      and only a denial audit.
+  S12 new-winner adjudication during the rebuild wait: the first winner goes
+      terminal (freeing the key); while the first loser's rebuild INSERT is
+      itself waiting on ``uq_migration_idem_open``, a second concurrent
+      request commits a NEW open session under the same key. Same request
+      body (loser A) → 200 replay of the new winner; different body (loser B)
+      → 409 IDEMPOTENCY_CONFLICT naming the new winner. Neither loser leaves
+      a session or a success audit.
+  S13 rebuild-insert versus target-revoke transaction ordering: the rebuild
+      takes the target policy-version row ``FOR UPDATE`` (custody row locked
+      first, so no lock-order inversion with destruction/submit paths). A
+      real concurrent revoke blocks on that row until the creation commits —
+      the rebuilt 201 session is queryable and the revoke then 409s on its
+      active-head guard, deterministically ordered, with no deadlock and no
+      500.
+  S14 a non-target database error raised at the rebuild re-validation point
+      (``migration.after_rebuild_recheck`` gate) surfaces verbatim as a 500
+      (never translated into MIGRATION_TARGET_INVALID /
+      IDEMPOTENCY_CONFLICT) and rolls back cleanly; the same key retries
+      afterwards.
 """
 from __future__ import annotations
 
@@ -159,24 +200,81 @@ class Harness:
         self.cust = {c["name"]: c for c in creds["custodians"]}
         self.secret = b"migration-start-idempotency-regression-012345"
 
-    async def make_source_and_target(self, tag: str) -> tuple[str, str, str]:
+    async def make_source_and_target(self, tag: str,
+                                    target_epoch: dict | None = None
+                                    ) -> tuple[str, str, str]:
         """Fresh valid 2-of-3 source policy+custody and a distinct target."""
         src = f"pol_s_{tag}_src"
         tgt = f"pol_s_{tag}_tgt"
-        epoch = {"valid_from": "2026-01-01T00:00:00Z",
-                 "valid_until": "2035-01-01T00:00:00Z", "rotation_interval": 0}
-        for pid in (src, tgt):
-            r = await self.http.post("/policies", headers=auth(self.tenant_key), json={
-                "policy_id": pid, "threshold": 2,
-                "custodian_ids": ["cus_demo_alice", "cus_demo_bob", "cus_demo_carol"],
-                "epoch": epoch,
-            })
-            assert r.status_code == 201, r.text
+        epoch = target_epoch or {"valid_from": "2026-01-01T00:00:00Z",
+                                 "valid_until": "2035-01-01T00:00:00Z",
+                                 "rotation_interval": 0}
+        src_epoch = {"valid_from": "2026-01-01T00:00:00Z",
+                     "valid_until": "2035-01-01T00:00:00Z", "rotation_interval": 0}
+        r = await self.http.post("/policies", headers=auth(self.tenant_key), json={
+            "policy_id": src, "threshold": 2,
+            "custodian_ids": ["cus_demo_alice", "cus_demo_bob", "cus_demo_carol"],
+            "epoch": src_epoch,
+        })
+        assert r.status_code == 201, r.text
+        r = await self.http.post("/policies", headers=auth(self.tenant_key), json={
+            "policy_id": tgt, "threshold": 2,
+            "custodian_ids": ["cus_demo_alice", "cus_demo_bob", "cus_demo_carol"],
+            "epoch": epoch,
+        })
+        assert r.status_code == 201, r.text
         r = await self.http.post("/custodies", headers=auth(self.tenant_key), json={
             "policy_id": src, "expected_version": 1, "secret_hex": self.secret.hex(),
         })
         assert r.status_code == 201, r.text
         return src, tgt, r.json()["custody_id"]
+
+    async def make_source(self, tag: str, epoch: dict) -> tuple[str, str]:
+        """A fresh 2-of-3 source policy with a custom epoch + one custody."""
+        src = f"pol_s_{tag}_src"
+        r = await self.http.post("/policies", headers=auth(self.tenant_key), json={
+            "policy_id": src, "threshold": 2,
+            "custodian_ids": ["cus_demo_alice", "cus_demo_bob", "cus_demo_carol"],
+            "epoch": epoch,
+        })
+        assert r.status_code == 201, r.text
+        r = await self.http.post("/custodies", headers=auth(self.tenant_key), json={
+            "policy_id": src, "expected_version": 1, "secret_hex": self.secret.hex(),
+        })
+        assert r.status_code == 201, r.text
+        return src, r.json()["custody_id"]
+
+    async def make_target(self, tag: str, epoch: dict | None = None) -> str:
+        tgt = f"pol_s_{tag}_tgt"
+        r = await self.http.post("/policies", headers=auth(self.tenant_key), json={
+            "policy_id": tgt, "threshold": 2,
+            "custodian_ids": ["cus_demo_alice", "cus_demo_bob", "cus_demo_carol"],
+            "epoch": epoch or {"valid_from": "2026-01-01T00:00:00Z",
+                               "valid_until": "2035-01-01T00:00:00Z",
+                               "rotation_interval": 0},
+        })
+        assert r.status_code == 201, r.text
+        return tgt
+
+    async def second_custody(self, src: str, tag: str) -> str:
+        r = await self.http.post("/custodies", headers=auth(self.tenant_key), json={
+            "policy_id": src, "expected_version": 1,
+            "secret_hex": (self.secret + tag.encode()).hex(),
+        })
+        assert r.status_code == 201, r.text
+        return r.json()["custody_id"]
+
+    async def drive_winner_failed(self, winner_id: str) -> None:
+        """Drive an open winner into the ``failed`` terminal state via a gap."""
+        pa = await self.prep("alice", winner_id)
+        r1 = await self.submit(pa)
+        assert r1.status_code == 200, r1.text
+        app.state.pending.clear(winner_id)
+        pb = await self.prep("bob", winner_id)
+        r2 = await self.submit(pb)
+        assert r2.status_code == 409 and body_of(r2).get("error", {}).get("code") == "THRESHOLD_NOT_MET", r2.text
+        row = await self.mig_row(winner_id)
+        assert row["status"] == "failed" and row["new_custody_id"] is None
 
     async def start(self, source_custody_id: str, target: str, idem: str,
                     extra_headers: dict | None = None):
@@ -208,7 +306,13 @@ class Harness:
             "SELECT error_code, basis FROM audit_log "
             "WHERE action='migration.start' AND result='denied' AND resource=$1",
             cid)
-        return [{"error_code": r["error_code"], "basis": r["basis"]} for r in rows]
+        out = []
+        for r in rows:
+            basis = r["basis"]
+            if isinstance(basis, str):
+                basis = json.loads(basis)
+            out.append({"error_code": r["error_code"], "basis": basis})
+        return out
 
     async def ok_audits(self, cid: str) -> int:
         return await self.pool.fetchval(
@@ -635,6 +739,432 @@ async def scenario_s8(hs: Harness, board: FaultBoard, tag: str) -> None:
           f"{rr2.status_code} {rr2.text[:200]}")
 
 
+async def scenario_s9(hs: Harness, board: FaultBoard, tag: str) -> None:
+    """Winner fails + TARGET revoked while loser parked -> target-invalid rebuild."""
+    label = "S9(rebuild-target-revoked)"
+    _, tgt_a, cid_a = await hs.make_source_and_target(f"{tag}a")
+    src_b, tgt_b, cid_b = await hs.make_source_and_target(f"{tag}b")
+    key = f"s9-{tag}"
+    gate_a = {"X-Fault-Key": f"{label}-a",
+              "X-Fault-Gate": "migration.after_idem_check"}
+    gate_b = {"X-Fault-Key": f"{label}-b",
+              "X-Fault-Gate": "migration.after_idem_check,migration.after_insert_conflict"}
+
+    ta = asyncio.create_task(hs.start(cid_a, tgt_a, key, gate_a))
+    tb = asyncio.create_task(hs.start(cid_b, tgt_b, key, gate_b))
+    await board.wait_reached(f"migration.after_idem_check:{label}-a")
+    await board.wait_reached(f"migration.after_idem_check:{label}-b")
+    await board.release_gate(f"migration.after_idem_check:{label}-a")
+    ra = await ta
+    winner_id = body_of(ra).get("migration_id")
+    check(f"{label}: first request -> 201 open session",
+          ra.status_code == 201 and body_of(ra).get("status") == "open"
+          and bool(winner_id), f"{ra.status_code} {ra.text[:200]}")
+
+    await board.release_gate(f"migration.after_idem_check:{label}-b")
+    await board.wait_reached(f"migration.after_insert_conflict:{label}-b")
+
+    # 胜方 failed（键位释放）+ 目标策略版本被撤销：撤销的是目标版本，
+    # 与两侧源 custody 行锁互不阻塞。
+    await hs.drive_winner_failed(winner_id)
+    rr = await hs.http.post(f"/policies/{tgt_b}/revoke",
+                            headers=auth(hs.tenant_key), json={"expected_version": 1})
+    check(f"{label}: target policy revoked while loser parked",
+          rr.status_code == 200, rr.text[:200])
+
+    await board.release_gate(f"migration.after_insert_conflict:{label}-b")
+    rb = await tb
+    err = body_of(rb).get("error", {})
+    check(f"{label}: loser rebuild -> 409 MIGRATION_TARGET_INVALID (not stale 201, not 500)",
+          rb.status_code == 409 and err.get("code") == "MIGRATION_TARGET_INVALID"
+          and err.get("basis", {}).get("reason") == "target_policy_revoked",
+          f"{rb.status_code} {rb.text[:240]}")
+
+    # 不留下会话（更不能有绑定已撤销目标的 open 会话），不留成功审计；
+    # 恰一条独立拒绝审计。
+    rows_b = await hs.sessions_for_source(cid_b)
+    check(f"{label}: loser left NO migration session", rows_b == [], str(rows_b))
+    check(f"{label}: loser has no migration.start ok audit",
+          await hs.ok_audits(cid_b) == 0)
+    denied_b = await hs.denied_audits(cid_b)
+    check(f"{label}: exactly one denial audit (MIGRATION_TARGET_INVALID)",
+          len(denied_b) == 1 and denied_b[0]["error_code"] == "MIGRATION_TARGET_INVALID",
+          str(denied_b))
+    check(f"{label}: denial audit names the revoked target",
+          denied_b[0]["basis"].get("policy_id") == tgt_b
+          and denied_b[0]["basis"].get("status") == "revoked", str(denied_b))
+    check(f"{label}: open placeholder count for the key is zero",
+          await hs.open_count_for_key(key) == 0)
+
+    # 目标仍撤销：换新键立即再试也得到同样的确定性拒绝（不随键变化）。
+    rx = await hs.start(cid_b, tgt_b, f"s9-fresh-{tag}")
+    check(f"{label}: fresh-key retry against revoked target still 409 target-invalid",
+          rx.status_code == 409
+          and body_of(rx).get("error", {}).get("code") == "MIGRATION_TARGET_INVALID",
+          f"{rx.status_code} {rx.text[:200]}")
+
+    # 目标轮换出新的有效版本后，从源记录用新键可成功迁移到新版本。
+    epoch2 = {"valid_from": "2026-10-01T00:00:00Z",
+              "valid_until": "2036-01-01T00:00:00Z", "rotation_interval": 0}
+    rrot = await hs.http.post(f"/policies/{tgt_b}/rotate", headers=auth(hs.tenant_key),
+                              json={"expected_version": 1, "epoch": epoch2})
+    # 旧版本已被显式撤销，rotate 要求 head active -> 预期 POLICY_INACTIVE；
+    # 改为新建另一条目标策略验证“有效才可新建”。
+    check(f"{label}: revoked head cannot rotate (POLICY_INACTIVE)",
+          rrot.status_code == 409
+          and body_of(rrot).get("error", {}).get("code") == "POLICY_INACTIVE",
+          f"{rrot.status_code} {rrot.text[:160]}")
+    tgt_new = await hs.make_target(f"{tag}new")
+    rn = await hs.start(cid_b, tgt_new, f"s9-valid-{tag}")
+    check(f"{label}: valid new target -> 201 open session",
+          rn.status_code == 201 and body_of(rn).get("status") == "open"
+          and body_of(rn).get("target_policy_id") == tgt_new
+          and body_of(rn).get("source_custody_id") == cid_b,
+          f"{rn.status_code} {rn.text[:200]}")
+
+
+async def scenario_s10(hs: Harness, board: FaultBoard, tag: str) -> None:
+    """TARGET epoch expires on the wall clock while the loser is parked."""
+    label = "S10(rebuild-target-epoch-expired)"
+    # 目标 epoch 在“不久后”到期（真实墙钟），保证创建预查时有效、等待后失效。
+    from datetime import datetime, timedelta, timezone
+    valid_from = (datetime.now(timezone.utc) - timedelta(seconds=300))
+    valid_until = datetime.now(timezone.utc) + timedelta(seconds=3)
+    short_epoch = {"valid_from": valid_from.isoformat().replace("+00:00", "Z"),
+                   "valid_until": valid_until.isoformat().replace("+00:00", "Z"),
+                   "rotation_interval": 0}
+    _, tgt_a, cid_a = await hs.make_source_and_target(f"{tag}a")
+    src_b = f"pol_s_{tag}b_src"
+    _, cid_b = await hs.make_source(f"{tag}b", {
+        "valid_from": "2026-01-01T00:00:00Z",
+        "valid_until": "2035-01-01T00:00:00Z", "rotation_interval": 0})
+    tgt_b = await hs.make_target(f"{tag}b", short_epoch)
+    key = f"s10-{tag}"
+    gate_a = {"X-Fault-Key": f"{label}-a",
+              "X-Fault-Gate": "migration.after_idem_check"}
+    gate_b = {"X-Fault-Key": f"{label}-b",
+              "X-Fault-Gate": "migration.after_idem_check,migration.after_insert_conflict"}
+
+    ta = asyncio.create_task(hs.start(cid_a, tgt_a, key, gate_a))
+    tb = asyncio.create_task(hs.start(cid_b, tgt_b, key, gate_b))
+    await board.wait_reached(f"migration.after_idem_check:{label}-a")
+    await board.wait_reached(f"migration.after_idem_check:{label}-b")
+    await board.release_gate(f"migration.after_idem_check:{label}-a")
+    ra = await ta
+    winner_id = body_of(ra).get("migration_id")
+    check(f"{label}: winner 201 open (target epoch still valid at pre-check)",
+          ra.status_code == 201 and bool(winner_id), f"{ra.status_code} {ra.text[:200]}")
+
+    await board.release_gate(f"migration.after_idem_check:{label}-b")
+    await board.wait_reached(f"migration.after_insert_conflict:{label}-b")
+    await hs.drive_winner_failed(winner_id)
+    # 等待真实墙钟越过目标 epoch valid_until（事务开始时的旧时间尚在窗口内）。
+    await asyncio.sleep(3.5)
+
+    await board.release_gate(f"migration.after_insert_conflict:{label}-b")
+    rb = await tb
+    err = body_of(rb).get("error", {})
+    check(f"{label}: rebuild uses fresh clock -> 409 target_epoch_expired (not stale 201)",
+          rb.status_code == 409 and err.get("code") == "MIGRATION_TARGET_INVALID"
+          and err.get("basis", {}).get("reason") == "target_epoch_expired",
+          f"{rb.status_code} {rb.text[:240]}")
+    check(f"{label}: no session left, one denial audit, no ok audit",
+          await hs.sessions_for_source(cid_b) == []
+          and await hs.ok_audits(cid_b) == 0
+          and [d["error_code"] for d in await hs.denied_audits(cid_b)]
+          == ["MIGRATION_TARGET_INVALID"])
+
+
+async def scenario_s11(hs: Harness, board: FaultBoard, tag: str) -> None:
+    """SOURCE epoch expires on the wall clock while the loser is parked."""
+    label = "S11(rebuild-source-epoch-expired)"
+    from datetime import datetime, timedelta, timezone
+    valid_until = datetime.now(timezone.utc) + timedelta(seconds=3)
+    short_epoch = {"valid_from": datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+                   .replace("+00:00", "Z"),
+                   "valid_until": valid_until.isoformat().replace("+00:00", "Z"),
+                   "rotation_interval": 0}
+    _, tgt_a, cid_a = await hs.make_source_and_target(f"{tag}a")
+    src_b, cid_b = await hs.make_source(f"{tag}b", short_epoch)
+    tgt_b = await hs.make_target(f"{tag}b")
+    key = f"s11-{tag}"
+    gate_a = {"X-Fault-Key": f"{label}-a",
+              "X-Fault-Gate": "migration.after_idem_check"}
+    gate_b = {"X-Fault-Key": f"{label}-b",
+              "X-Fault-Gate": "migration.after_idem_check,migration.after_insert_conflict"}
+
+    ta = asyncio.create_task(hs.start(cid_a, tgt_a, key, gate_a))
+    tb = asyncio.create_task(hs.start(cid_b, tgt_b, key, gate_b))
+    await board.wait_reached(f"migration.after_idem_check:{label}-a")
+    await board.wait_reached(f"migration.after_idem_check:{label}-b")
+    await board.release_gate(f"migration.after_idem_check:{label}-a")
+    ra = await ta
+    winner_id = body_of(ra).get("migration_id")
+    check(f"{label}: winner 201 open", ra.status_code == 201 and bool(winner_id),
+          f"{ra.status_code} {ra.text[:200]}")
+
+    await board.release_gate(f"migration.after_idem_check:{label}-b")
+    await board.wait_reached(f"migration.after_insert_conflict:{label}-b")
+    await hs.drive_winner_failed(winner_id)
+    await asyncio.sleep(3.5)
+
+    await board.release_gate(f"migration.after_insert_conflict:{label}-b")
+    rb = await tb
+    err = body_of(rb).get("error", {})
+    check(f"{label}: rebuild re-reads source -> 409 source_epoch_expired",
+          rb.status_code == 409 and err.get("code") == "MIGRATION_SOURCE_INVALID"
+          and err.get("basis", {}).get("reason") == "source_epoch_expired",
+          f"{rb.status_code} {rb.text[:240]}")
+    check(f"{label}: no session left, one source-invalid denial audit",
+          await hs.sessions_for_source(cid_b) == []
+          and await hs.ok_audits(cid_b) == 0
+          and [d["error_code"] for d in await hs.denied_audits(cid_b)]
+          == ["MIGRATION_SOURCE_INVALID"])
+
+
+async def scenario_s12(hs: Harness, board: FaultBoard, tag: str) -> None:
+    """A NEW winner commits while the rebuild waits: replay vs conflict.
+
+    The first winner goes terminal (key free). The rebuilding loser is pinned
+    at ``migration.after_rebuild_recheck`` (fresh re-validation done, target
+    row locked, rebuild INSERT not yet attempted) while a second request
+    starts under the same key. Two independent sub-cases:
+
+    * 12a the new winner binds the SAME source custody + target as the loser:
+      the loser's rebuild INSERT waits on ``uq_migration_idem_open`` (and the
+      per-source open index), the new winner commits first, and the loser
+      replays it — 200 with the new winner's session.
+    * 12b the new winner binds a DIFFERENT source: the loser's rebuild INSERT
+      hits ``uq_migration_idem_open``; after its savepoint rollback it
+      re-reads the new live winner and returns 409 IDEMPOTENCY_CONFLICT
+      naming that new winner.
+    """
+    # ---- 12a: new winner same body -> rebuilding loser replays (200) --------
+    label = "S12a(rebuild-new-winner-same-body)"
+    _, tgt_a, cid_a = await hs.make_source_and_target(f"{tag}a")
+    _, tgt_b, cid_b = await hs.make_source_and_target(f"{tag}b")
+    key = f"s12a-{tag}"
+    ga = {"X-Fault-Key": f"{label}-a", "X-Fault-Gate": "migration.after_idem_check"}
+    gb = {"X-Fault-Key": f"{label}-b",
+          "X-Fault-Gate": "migration.after_idem_check,migration.after_insert_conflict,"
+                          "migration.after_rebuild_recheck"}
+    ta = asyncio.create_task(hs.start(cid_a, tgt_a, key, ga))
+    tb = asyncio.create_task(hs.start(cid_b, tgt_b, key, gb))
+    await board.wait_reached(f"migration.after_idem_check:{label}-a")
+    await board.wait_reached(f"migration.after_idem_check:{label}-b")
+    await board.release_gate(f"migration.after_idem_check:{label}-a")
+    ra = await ta
+    winner1 = body_of(ra).get("migration_id")
+    check(f"{label}: winner 201 open", ra.status_code == 201 and bool(winner1), ra.text[:160])
+    await board.release_gate(f"migration.after_idem_check:{label}-b")
+    await board.wait_reached(f"migration.after_insert_conflict:{label}-b")
+    await hs.drive_winner_failed(winner1)
+    # 放行后败方重新裁决并钉在“重建 INSERT 之前”。
+    await board.release_gate(f"migration.after_insert_conflict:{label}-b")
+    await board.wait_reached(f"migration.after_rebuild_recheck:{label}-b")
+
+    # 新赢家：同键、同源 cid_b、同目标 tgt_b —— 与败方重建请求体完全相同。
+    # 同源故新赢家在败方仍持有的源 custody 行锁上排队；败方重建 INSERT 撞其
+    # 自己持有事务内先前保存点已回滚、键位空闲——它会先插入成功并随后提交，
+    # 新赢家拿锁后经预查重放。为精确钉住“重建 INSERT 等待期间出现新赢家”，
+    # 败方重建事务在 INSERT 撞 uq_migration_idem_open 时键位空闲不会等待；
+    # 因此让新赢家先在源行锁队列中等待，败方提交后它即为该键的新 open 赢家，
+    # 其请求结果必须是同请求体重放（200），而不是 409/500。
+    tnew = asyncio.create_task(hs.start(cid_b, tgt_b, key))
+    queued = await wait_lock_waiters(hs.pool, 1, "key_custodies")
+    check(f"{label}: same-body new winner queues on the source custody lock",
+          queued == 1, f"q={queued}")
+    # 放行败方重建 INSERT 并提交；排队者拿锁后预查命中新会话 -> 200 重放。
+    await board.release_gate(f"migration.after_rebuild_recheck:{label}-b")
+    rb = await tb
+    rebuilt_id = body_of(rb).get("migration_id")
+    rnew = await tnew
+    check(f"{label}: rebuilding loser commits its rebuilt session -> 201",
+          rb.status_code == 201 and body_of(rb).get("status") == "open"
+          and body_of(rb).get("source_custody_id") == cid_b,
+          f"{rb.status_code} {rb.text[:200]}")
+    check(f"{label}: queued same-body same-key request replays rebuilt winner -> 200",
+          rnew.status_code == 200 and body_of(rnew).get("migration_id") == rebuilt_id,
+          f"{rnew.status_code} {rnew.text[:200]}")
+    check(f"{label}: exactly one session row for cid_b",
+          [r["id"] for r in await hs.sessions_for_source(cid_b)] == [rebuilt_id])
+    check(f"{label}: exactly one ok audit, no denials for cid_b",
+          await hs.ok_audits(cid_b) == 1 and await hs.denied_audits(cid_b) == [])
+
+    # ---- 12b: new winner different body -> rebuilding loser 409 -------------
+    label = "S12b(rebuild-new-winner-diff-body)"
+    _, tgt_c, cid_c = await hs.make_source_and_target(f"{tag}c")
+    _, tgt_d, cid_d = await hs.make_source_and_target(f"{tag}d")
+    key2 = f"s12b-{tag}"
+    gc = {"X-Fault-Key": f"{label}-c", "X-Fault-Gate": "migration.after_idem_check"}
+    gd = {"X-Fault-Key": f"{label}-d",
+          "X-Fault-Gate": "migration.after_idem_check,migration.after_insert_conflict,"
+                          "migration.after_rebuild_recheck"}
+    tc = asyncio.create_task(hs.start(cid_c, tgt_c, key2, gc))
+    td = asyncio.create_task(hs.start(cid_d, tgt_d, key2, gd))
+    await board.wait_reached(f"migration.after_idem_check:{label}-c")
+    await board.wait_reached(f"migration.after_idem_check:{label}-d")
+    await board.release_gate(f"migration.after_idem_check:{label}-c")
+    rc = await tc
+    winner2 = body_of(rc).get("migration_id")
+    check(f"{label}: winner 201 open", rc.status_code == 201 and bool(winner2), rc.text[:160])
+    await board.release_gate(f"migration.after_idem_check:{label}-d")
+    await board.wait_reached(f"migration.after_insert_conflict:{label}-d")
+    await hs.drive_winner_failed(winner2)
+    await board.release_gate(f"migration.after_insert_conflict:{label}-d")
+    await board.wait_reached(f"migration.after_rebuild_recheck:{label}-d")
+
+    # 新赢家2：同键、绑定另一条源 cid_c（与 D 的请求体不同源）。行锁互不重叠，
+    # 故可在 D 的重建 INSERT 前先提交，持有 uq_migration_idem_open。
+    tnew2 = asyncio.create_task(hs.start(cid_c, tgt_c, key2))
+    # 等新赢家2完整提交（它不与 D 的源行锁冲突）。
+    rnew2 = await tnew2
+    nw2 = body_of(rnew2).get("migration_id")
+    check(f"{label}: new winner on a different source commits -> 201",
+          rnew2.status_code == 201 and body_of(rnew2).get("source_custody_id") == cid_c
+          and body_of(rnew2).get("status") == "open",
+          f"{rnew2.status_code} {rnew2.text[:200]}")
+    # 放行 D 的重建 INSERT：撞 uq_migration_idem_open，重读判出新赢家 -> 409。
+    await board.release_gate(f"migration.after_rebuild_recheck:{label}-d")
+    rd = await td
+    err = body_of(rd).get("error", {})
+    check(f"{label}: rebuilding loser -> 409 IDEMPOTENCY_CONFLICT vs the NEW winner",
+          rd.status_code == 409 and err.get("code") == "IDEMPOTENCY_CONFLICT"
+          and err.get("basis", {}).get("reason") == "concurrent_open_with_same_idempotency_key"
+          and err.get("basis", {}).get("migration_id") == nw2
+          and err.get("basis", {}).get("winner_source_custody_id") == cid_c,
+          f"{rd.status_code} {rd.text[:240]}")
+    check(f"{label}: cid_d loser left no session/ok audit, one denial audit",
+          await hs.sessions_for_source(cid_d) == []
+          and await hs.ok_audits(cid_d) == 0
+          and [d["error_code"] for d in await hs.denied_audits(cid_d)]
+          == ["IDEMPOTENCY_CONFLICT"])
+    # 已完成赢家可重放：同键同体（cid_c+tgt_c）重放新赢家2 -> 200。
+    rr = await hs.start(cid_c, tgt_c, key2)
+    check(f"{label}: committed new winner remains replayable with the same key -> 200",
+          rr.status_code == 200 and body_of(rr).get("migration_id") == nw2,
+          f"{rr.status_code} {rr.text[:200]}")
+
+
+async def scenario_s13(hs: Harness, board: FaultBoard, tag: str) -> None:
+    """Rebuild insert vs target revoke are ordered by the FOR UPDATE row lock."""
+    label = "S13(rebuild-vs-revoke-order)"
+    _, tgt_a, cid_a = await hs.make_source_and_target(f"{tag}a")
+    _, tgt_b, cid_b = await hs.make_source_and_target(f"{tag}b")
+    key = f"s13-{tag}"
+    ga = {"X-Fault-Key": f"{label}-a", "X-Fault-Gate": "migration.after_idem_check"}
+    gb = {"X-Fault-Key": f"{label}-b",
+          "X-Fault-Gate": "migration.after_idem_check,migration.after_insert_conflict,"
+                          "migration.rebuild_target_locked"}
+    ta = asyncio.create_task(hs.start(cid_a, tgt_a, key, ga))
+    tb = asyncio.create_task(hs.start(cid_b, tgt_b, key, gb))
+    await board.wait_reached(f"migration.after_idem_check:{label}-a")
+    await board.wait_reached(f"migration.after_idem_check:{label}-b")
+    await board.release_gate(f"migration.after_idem_check:{label}-a")
+    ra = await ta
+    winner_id = body_of(ra).get("migration_id")
+    check(f"{label}: winner 201 open", ra.status_code == 201 and bool(winner_id), ra.text[:160])
+    await board.release_gate(f"migration.after_idem_check:{label}-b")
+    await board.wait_reached(f"migration.after_insert_conflict:{label}-b")
+    await hs.drive_winner_failed(winner_id)
+
+    # 放行败方重读：胜方 failed -> 重建裁决；其重新锁住目标版本行后钉住。
+    await board.release_gate(f"migration.after_insert_conflict:{label}-b")
+    await board.wait_reached(f"migration.rebuild_target_locked:{label}-b")
+
+    # 重建事务已持目标版本行 FOR UPDATE；真实撤销事务此刻必在该行锁上排队。
+    revoke_task = asyncio.create_task(hs.http.post(
+        f"/policies/{tgt_b}/revoke", headers=auth(hs.tenant_key),
+        json={"expected_version": 1}))
+
+    async def _revoke_waiters() -> int:
+        # 行锁等待在 pg_locks 中表现为对持锁事务 xid 的未授予
+        # transactionid 锁（tuple 锁本身已 granted）。
+        return await hs.pool.fetchval(
+            """
+            SELECT count(*)
+            FROM pg_locks l
+            JOIN pg_stat_activity a ON a.pid = l.pid
+            WHERE l.locktype = 'transactionid' AND NOT l.granted
+              AND a.query LIKE '%UPDATE policies%'
+            """)
+    queued = 0
+    for _ in range(150):
+        queued = await _revoke_waiters()
+        if queued >= 1 or tb.done():
+            break
+        await asyncio.sleep(0.02)
+    check(f"{label}: concurrent revoke queues on the rebuild's target row lock",
+          queued >= 1 and not tb.done(), f"queued={queued} tb_done={tb.done()}")
+
+    # 放行重建：重建 INSERT + 成功审计先提交，撤销随后拿锁提交——确定性先后。
+    await board.release_gate(f"migration.rebuild_target_locked:{label}-b")
+    rb = await tb
+    body_b = body_of(rb)
+    check(f"{label}: rebuild commits its own 201 open session first",
+          rb.status_code == 201 and body_b.get("status") == "open"
+          and body_b.get("target_policy_id") == tgt_b
+          and body_b.get("source_custody_id") == cid_b,
+          f"{rb.status_code} {rb.text[:200]}")
+    rrev = await revoke_task
+    check(f"{label}: revoke proceeds after rebuild commits (ordered, no deadlock/500)",
+          rrev.status_code == 200 and body_of(rrev).get("status") == "revoked",
+          f"{rrev.status_code} {rrev.text[:200]}")
+    rows_b = await hs.sessions_for_source(cid_b)
+    check(f"{label}: rebuilt session exists and is queryable",
+          len(rows_b) == 1 and rows_b[0]["id"] == body_b.get("migration_id"), str(rows_b))
+    g = await hs.http.get(f"/migrations/{body_b['migration_id']}",
+                          headers=auth(hs.tenant_key))
+    check(f"{label}: GET rebuilt session -> 200",
+          g.status_code == 200 and body_of(g).get("migration_id") == body_b["migration_id"],
+          g.text[:160])
+    check(f"{label}: rebuild left one ok audit, no denial",
+          await hs.ok_audits(cid_b) == 1 and await hs.denied_audits(cid_b) == [])
+    # 撤销随后确定性生效：换用新键再发起（终态后重建）必被 target-invalid 拒绝。
+    rr = await hs.start(cid_b, tgt_b, f"s13-again-{tag}")
+    check(f"{label}: after revoke commits, a new start hits target-invalid",
+          rr.status_code == 409
+          and body_of(rr).get("error", {}).get("code") == "MIGRATION_TARGET_INVALID",
+          f"{rr.status_code} {rr.text[:200]}")
+
+
+async def scenario_s14(hs: Harness, board: FaultBoard, tag: str) -> None:
+    """A generic failure at rebuild re-validation is a 500, never mistranslated."""
+    label = "S14(rebuild-generic-error-500)"
+    _, tgt_a, cid_a = await hs.make_source_and_target(f"{tag}a")
+    _, tgt_b, cid_b = await hs.make_source_and_target(f"{tag}b")
+    key = f"s14-{tag}"
+    ga = {"X-Fault-Key": f"{label}-a", "X-Fault-Gate": "migration.after_idem_check"}
+    gb = {"X-Fault-Key": f"{label}-b",
+          "X-Fault-Gate": "migration.after_idem_check,migration.after_insert_conflict",
+          # 重建重新裁决完成、重试 INSERT 之前注入通用故障（必须原样 500）。
+          "X-Fault-Fail": "migration.after_rebuild_recheck:RAISE"}
+    ta = asyncio.create_task(hs.start(cid_a, tgt_a, key, ga))
+    tb = asyncio.create_task(hs.start(cid_b, tgt_b, key, gb))
+    await board.wait_reached(f"migration.after_idem_check:{label}-a")
+    await board.wait_reached(f"migration.after_idem_check:{label}-b")
+    await board.release_gate(f"migration.after_idem_check:{label}-a")
+    ra = await ta
+    winner_id = body_of(ra).get("migration_id")
+    assert ra.status_code == 201, ra.text
+    await board.release_gate(f"migration.after_idem_check:{label}-b")
+    await board.wait_reached(f"migration.after_insert_conflict:{label}-b")
+    await hs.drive_winner_failed(winner_id)
+    await board.release_gate(f"migration.after_insert_conflict:{label}-b")
+    rb = await tb
+    check(f"{label}: rebuild-time generic failure -> 500 (not 409/target-invalid)",
+          rb.status_code == 500, f"{rb.status_code} {rb.text[:160]}")
+    check(f"{label}: no session, no audit after the generic failure",
+          await hs.sessions_for_source(cid_b) == []
+          and await hs.ok_audits(cid_b) == 0
+          and await hs.denied_audits(cid_b) == [])
+    # 同键/新键随后可干净重试（目标仍有效）。
+    rr = await hs.start(cid_b, tgt_b, f"s14-retry-{tag}")
+    check(f"{label}: fresh key retries cleanly -> 201",
+          rr.status_code == 201 and body_of(rr).get("status") == "open",
+          f"{rr.status_code} {rr.text[:160]}")
+
+
 async def amain() -> int:
     async with server() as (http, pool, board):
         creds = demo_credentials()
@@ -648,6 +1178,12 @@ async def amain() -> int:
         await scenario_s6(hs, f"{suffix}6")
         await scenario_s7(hs, board, f"{suffix}7")
         await scenario_s8(hs, board, f"{suffix}8")
+        await scenario_s9(hs, board, f"{suffix}9")
+        await scenario_s10(hs, board, f"{suffix}10")
+        await scenario_s11(hs, board, f"{suffix}11")
+        await scenario_s12(hs, board, f"{suffix}12")
+        await scenario_s13(hs, board, f"{suffix}13")
+        await scenario_s14(hs, board, f"{suffix}14")
 
         r = await http.get("/audit/replay", headers=auth(hs.tenant_key))
         check("final: audit hash chain valid across start-race scenarios",

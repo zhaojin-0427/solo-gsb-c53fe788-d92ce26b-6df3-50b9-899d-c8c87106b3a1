@@ -51,11 +51,26 @@ reading only ``open`` rows would miss that committed winner and re-raise the
 database exception with no denial audit. Rows in a terminal state
 (``expired``/``failed``/``destroyed``) never act as the winner: if the row
 that held the index has since terminated, the key placeholder is free and the
-creation is re-validated under the post-terminal rebuild rules (a bounded
-insert retry), exactly as if the request had arrived after the terminal
-transition.
+creation is **re-adjudicated as a brand-new request arriving after the
+terminal transition** — not retried with the transaction's pre-wait snapshot.
+The source custody row and both immutable policy-version rows are re-read,
+the target version row is taken ``FOR UPDATE`` so the rebuild insert and a
+concurrent target revoke are ordered by their commits (custody row locked
+first, per the global order), every validity/epoch check uses a fresh
+``clock_timestamp()`` (epoch windows expiring while the request waited on a
+lock can never pass on the transaction's frozen start time), and the bound
+policy digests are recomputed. A target that was revoked/expired during the
+wait fails the rebuild with ``MIGRATION_TARGET_INVALID`` and a separate
+denial audit — no open session and no success audit are ever left behind;
+only a still-valid request creates the rebuilt session. A *new* winner that
+appears during the rebuild wait keeps the standard adjudication: same
+request body replays it (200), a different body gets
+``IDEMPOTENCY_CONFLICT`` (409), a committed winner is replayable, and
+non-target database errors propagate verbatim.
 """
 from __future__ import annotations
+
+import datetime
 
 import asyncpg
 from fastapi import APIRouter, Header, Request, Response
@@ -299,59 +314,215 @@ async def start_migration(
     async with pool.acquire() as conn:
         try:
             async with conn.transaction():
-                # 源托管记录行锁：同一 custody 的并发创建/迁移完全串行，
-                # 消除“并发重复迁移”竞态（部分唯一索引再兜底）。
-                custody = await conn.fetchrow(
-                    "SELECT * FROM key_custodies WHERE id = $1 FOR UPDATE", body.source_custody_id
-                )
-                if custody is None:
-                    raise ApiError(E_NOT_FOUND, basis={"custody_id": body.source_custody_id})
-                if custody["tenant_id"] != tenant["id"]:
-                    raise ApiError(E_FORBIDDEN,
-                                   basis={"reason": "custody_belongs_to_other_tenant"})
-                # 已销毁记录（墓碑）不得再发起迁移：在线分片已删除。
-                if custody["status"] == "destroyed":
-                    raise ApiError(
-                        E_CUSTODY_DESTROYED,
-                        basis={"custody_id": custody["id"], "custody_status": custody["status"]},
-                    )
-                # 惰性过期：超过 TTL、或源侧已失效（custody 被轮换/撤销、源策略
-                # 版本被撤销/过期）的 open 会话在同源新事务（本事务随后提交）中
-                # 置 expired，释放两条部分唯一索引——失败后可用同键或新键安全重试，
-                # 且不会被一个“永远无法再完成”的 open 会话无限占位。
-                # （因内存待累计分片丢失而永远无法凑齐门限的会话，则在提交侧
-                # 检出缺片的同一事务里直接置 failed 终态，见 submit_share。）
-                await conn.execute(
-                    """
-                    UPDATE migration_sessions m SET status='expired'
-                    FROM key_custodies kc
-                    JOIN policies p ON p.id = kc.policy_id AND p.version = kc.policy_version
-                    WHERE m.source_custody_id = $1 AND m.status = 'open'
-                      AND kc.id = m.source_custody_id
-                      AND (now() >= m.valid_until
-                           OR kc.status <> 'active'
-                           OR p.status = 'revoked'
-                           OR now() >= p.epoch_valid_until)
-                    """,
-                    custody["id"],
-                )
-                source_policy = await repo.get_policy_version(
-                    conn, custody["policy_id"], custody["policy_version"]
-                )
-                now = await conn.fetchval("SELECT now()")
 
-                # 幂等重放优先：同键的已有会话（open/completed）原样返回；
-                # expired/failed/destroyed 行不占位（唯一索引不含三者），
-                # 终态后允许用同一幂等键（或新键）从源记录安全重新发起；
-                # destroyed 的源记录随后在下方以 CUSTODY_DESTROYED 确定性拒绝。
-                existing = await conn.fetchrow(
-                    "SELECT * FROM migration_sessions "
-                    "WHERE tenant_id=$1 AND idempotency_key_hash=$2 "
-                    "AND status NOT IN ('expired','failed','destroyed') "
-                    "ORDER BY created_at DESC LIMIT 1",
-                    tenant["id"], idem_hash,
-                )
-                if existing is not None:
+                async def _clock_now():
+                    # 决策时间必须取“语句当前时间”而非事务开始时间：请求在源
+                    # custody 行锁/唯一索引冲突上等待期间 epoch 可能恰好到期，
+                    # now()/transaction_timestamp() 在整个事务内冻结为开始时刻，
+                    # 会用旧时间把等待后才失效的源/目标误放行。重建裁决的每次
+                    # 尝试都重新取时钟。
+                    return await conn.fetchval("SELECT clock_timestamp()")
+
+                async def _expire_stale_open(custody):
+                    # 惰性过期：超过 TTL、或源侧已失效（custody 被轮换/撤销、源
+                    # 策略版本被撤销/过期）的 open 会话在同源新事务（本事务随后
+                    # 提交）中置 expired，释放两条部分唯一索引——失败后可用同键
+                    # 或新键安全重试，且不会被一个“永远无法再完成”的 open 会话
+                    # 无限占位。判据一律用 clock_timestamp()，等待期间跨过 TTL /
+                    # epoch 边界不会被事务开始时的旧时间放行。
+                    await conn.execute(
+                        """
+                        UPDATE migration_sessions m SET status='expired'
+                        FROM key_custodies kc
+                        JOIN policies p ON p.id = kc.policy_id AND p.version = kc.policy_version
+                        WHERE m.source_custody_id = $1 AND m.status = 'open'
+                          AND kc.id = m.source_custody_id
+                          AND (clock_timestamp() >= m.valid_until
+                               OR kc.status <> 'active'
+                               OR p.status = 'revoked'
+                               OR clock_timestamp() >= p.epoch_valid_until)
+                        """,
+                        custody["id"],
+                    )
+
+                async def _prepare_creation(*, lock_target: bool):
+                    """Re-validate the creation and return the insert inputs.
+
+                    ``lock_target`` is only set on a **post-terminal rebuild**
+                    attempt (the savepoint rolled back after the unique-index
+                    race and the key placeholder is free again). The rebuild is
+                    a brand-new creation decision arriving after a wait: source
+                    custody / source policy version / target policy version are
+                    all re-read fresh, the target policy version row is taken
+                    ``FOR UPDATE`` to arbitrate the rebuild-insert versus a
+                    concurrent policy revoke (their commit order then decides
+                    deterministically, in the custody-row-before-other-row lock
+                    order), and every validity / epoch check uses a fresh
+                    ``clock_timestamp()`` — never the policy rows, policy
+                    digests or wall time captured at the transaction's start.
+
+                    The first attempt deliberately does not lock the target
+                    row, so a tenant revoking a still-unreferenced target
+                    version is not blocked behind creation requests parked at
+                    test gates; the rebuild path is the only path whose
+                    decision happens after a blocking wait.
+                    """
+                    custody = await conn.fetchrow(
+                        "SELECT * FROM key_custodies WHERE id = $1 FOR UPDATE",
+                        body.source_custody_id,
+                    )
+                    if custody is None:
+                        raise ApiError(E_NOT_FOUND, basis={"custody_id": body.source_custody_id})
+                    if custody["tenant_id"] != tenant["id"]:
+                        raise ApiError(E_FORBIDDEN,
+                                       basis={"reason": "custody_belongs_to_other_tenant"})
+                    if custody["status"] == "destroyed":
+                        raise ApiError(
+                            E_CUSTODY_DESTROYED,
+                            basis={"custody_id": custody["id"], "custody_status": custody["status"]},
+                        )
+                    await _expire_stale_open(custody)
+                    source_policy = await repo.get_policy_version(
+                        conn, custody["policy_id"], custody["policy_version"]
+                    )
+                    now = await _clock_now()
+
+                    # 幂等重放优先：同键的已有会话（open/completed）原样返回；
+                    # expired/failed/destroyed 行不占位（唯一索引不含三者），
+                    # 终态后允许用同一幂等键（或新键）从源记录安全重新发起。
+                    existing = await conn.fetchrow(
+                        "SELECT * FROM migration_sessions "
+                        "WHERE tenant_id=$1 AND idempotency_key_hash=$2 "
+                        "AND status NOT IN ('expired','failed','destroyed') "
+                        "ORDER BY created_at DESC LIMIT 1",
+                        tenant["id"], idem_hash,
+                    )
+                    if existing is not None:
+                        return ("existing", existing)
+
+                    # 源必须仍有效：托管记录 active 且其策略版本未撤销/未过期。
+                    # 重建尝试时这些行全部按等待后的新状态重读——绝不复用事务
+                    # 开始时（可能更早的裁决前）的旧快照与旧时间。
+                    if custody["status"] != "active" or source_policy["status"] == "revoked":
+                        raise ApiError(
+                            E_MIGRATION_SOURCE_INVALID,
+                            basis={"custody_id": custody["id"],
+                                   "custody_status": custody["status"],
+                                   "policy_id": custody["policy_id"],
+                                   "version": custody["policy_version"],
+                                   "policy_status": source_policy["status"]},
+                        )
+                    if now >= source_policy["epoch_valid_until"]:
+                        raise ApiError(
+                            E_MIGRATION_SOURCE_INVALID,
+                            basis={"reason": "source_epoch_expired",
+                                   "valid_until": str(source_policy["epoch_valid_until"]),
+                                   "now": str(now)},
+                        )
+
+                    # 目标必须是另一条有效策略版本，且属于同一租户。
+                    if (
+                        body.target_policy_id == custody["policy_id"]
+                        and body.target_version == custody["policy_version"]
+                    ):
+                        raise ApiError(
+                            E_MIGRATION_TARGET_INVALID,
+                            basis={"reason": "target_identical_to_source",
+                                   "policy_id": body.target_policy_id,
+                                   "version": body.target_version},
+                        )
+                    if lock_target:
+                        # 重建裁决：锁住目标不可变版本行，与并发的策略撤销/轮换
+                        # 以提交先后确定性裁决——先提交撤销则下面只读到 revoked
+                        # 并以 MIGRATION_TARGET_INVALID 拒绝；先提交本插入则撤销
+                        # 等待，新会话按其创建时刻的有效版本固化摘要。锁序上
+                        # 源 custody 行已先行持有（custody 先于其它行），不会与
+                        # 销毁/提交路径形成锁序反转。
+                        target_policy = await conn.fetchrow(
+                            "SELECT * FROM policies WHERE id=$1 AND version=$2 FOR UPDATE",
+                            body.target_policy_id, body.target_version,
+                        )
+                        # 回归闸门：重建已持目标版本行锁、尚未完成裁决与重试
+                        # INSERT（仅测试构建启用）——钉住“重建插入 × 目标撤销”
+                        # 的真实行锁排队，验证二者提交先后的确定性。
+                        await faults.maybe_park(
+                            request, "migration.rebuild_target_locked")
+                    else:
+                        target_policy = await repo.get_policy_version(
+                            conn, body.target_policy_id, body.target_version
+                        )
+                    if target_policy is None:
+                        raise ApiError(
+                            E_MIGRATION_TARGET_INVALID,
+                            basis={"reason": "target_version_not_found",
+                                   "policy_id": body.target_policy_id,
+                                   "version": body.target_version},
+                        )
+                    if target_policy["tenant_id"] != tenant["id"]:
+                        raise ApiError(
+                            E_FORBIDDEN,
+                            basis={"reason": "target_policy_belongs_to_other_tenant"},
+                        )
+                    if target_policy["status"] != "active":
+                        raise ApiError(
+                            E_MIGRATION_TARGET_INVALID,
+                            basis={"reason": "target_policy_revoked",
+                                   "policy_id": body.target_policy_id,
+                                   "version": body.target_version,
+                                   "status": target_policy["status"]},
+                        )
+                    if now >= target_policy["epoch_valid_until"]:
+                        raise ApiError(
+                            E_MIGRATION_TARGET_INVALID,
+                            basis={"reason": "target_epoch_expired",
+                                   "policy_id": body.target_policy_id,
+                                   "version": body.target_version,
+                                   "valid_until": str(target_policy["epoch_valid_until"]),
+                                   "now": str(now)},
+                        )
+
+                    # 参数全部合法后再判“重复”：同 custody 的其他 open 会话，或
+                    # 已迁移完成。重建尝试时同样重读，等待期间源上出现的新赢家
+                    # 在此被确定性拦截。不同幂等键不得重复迁移。
+                    blocker = await conn.fetchrow(
+                        "SELECT id, status, new_custody_id FROM migration_sessions "
+                        "WHERE source_custody_id=$1 AND "
+                        "(status='open' OR new_custody_id IS NOT NULL) "
+                        "ORDER BY created_at DESC LIMIT 1",
+                        custody["id"],
+                    )
+                    if blocker is not None:
+                        if blocker["new_custody_id"] is not None:
+                            raise ApiError(
+                                E_MIGRATION_CONFLICT,
+                                basis={"reason": "custody_already_migrated",
+                                       "migration_id": blocker["id"],
+                                       "source_custody_id": custody["id"]},
+                            )
+                        raise ApiError(
+                            E_MIGRATION_CONFLICT,
+                            basis={"reason": "open_migration_exists_for_custody",
+                                   "migration_id": blocker["id"],
+                                   "source_custody_id": custody["id"]},
+                        )
+
+                    # 摘要必须在每次裁决时由刚读取（重建时为持锁读取）的不可变
+                    # 版本行重新计算：等待期间目标被轮换/撤销后，旧快照旧摘要
+                    # 绝不能被复用进新会话。
+                    source_digest = _digest_of_policy(source_policy)
+                    target_digest = _digest_of_policy(target_policy)
+                    valid_until = now + datetime.timedelta(seconds=ttl)
+                    return ("create", {
+                        "custody": custody,
+                        "source_policy": source_policy,
+                        "source_digest": source_digest,
+                        "target_digest": target_digest,
+                        "valid_until": valid_until,
+                    })
+
+                prepared = await _prepare_creation(lock_target=False)
+                if prepared[0] == "existing":
+                    existing = prepared[1]
                     if (
                         existing["source_custody_id"] != body.source_custody_id
                         or existing["target_policy_id"] != body.target_policy_id
@@ -378,113 +549,32 @@ async def start_migration(
                     out_count = count
                     out_new_digests = new_digests
                     replayed = True
+                    source_threshold = (
+                        await repo.get_policy_version(
+                            conn, mig_row["source_policy_id"], mig_row["source_version"]
+                        )
+                    )["threshold"]
                 else:
-                    # 先做确定性参数校验（源/目标有效性、跨租户、目标=源）：
-                    # 即使该 custody 已有 open 会话，非法请求仍返回其真正的拒绝依据。
-                    # 源必须仍有效：托管记录 active 且其策略版本未撤销/未过期。
-                    if custody["status"] != "active" or source_policy["status"] == "revoked":
-                        raise ApiError(
-                            E_MIGRATION_SOURCE_INVALID,
-                            basis={"custody_id": custody["id"],
-                                   "custody_status": custody["status"],
-                                   "policy_id": custody["policy_id"],
-                                   "version": custody["policy_version"],
-                                   "policy_status": source_policy["status"]},
-                        )
-                    if now >= source_policy["epoch_valid_until"]:
-                        raise ApiError(
-                            E_MIGRATION_SOURCE_INVALID,
-                            basis={"reason": "source_epoch_expired",
-                                   "valid_until": str(source_policy["epoch_valid_until"])},
-                        )
-
-                    # 目标必须是另一条有效策略版本，且属于同一租户。
-                    if (
-                        body.target_policy_id == custody["policy_id"]
-                        and body.target_version == custody["policy_version"]
-                    ):
-                        raise ApiError(
-                            E_MIGRATION_TARGET_INVALID,
-                            basis={"reason": "target_identical_to_source",
-                                   "policy_id": body.target_policy_id,
-                                   "version": body.target_version},
-                        )
-                    target_policy = await repo.get_policy_version(
-                        conn, body.target_policy_id, body.target_version
-                    )
-                    if target_policy is None:
-                        raise ApiError(
-                            E_MIGRATION_TARGET_INVALID,
-                            basis={"reason": "target_version_not_found",
-                                   "policy_id": body.target_policy_id,
-                                   "version": body.target_version},
-                        )
-                    if target_policy["tenant_id"] != tenant["id"]:
-                        raise ApiError(
-                            E_FORBIDDEN,
-                            basis={"reason": "target_policy_belongs_to_other_tenant"},
-                        )
-                    if target_policy["status"] != "active":
-                        raise ApiError(
-                            E_MIGRATION_TARGET_INVALID,
-                            basis={"reason": "target_policy_revoked",
-                                   "policy_id": body.target_policy_id,
-                                   "version": body.target_version,
-                                   "status": target_policy["status"]},
-                        )
-                    if now >= target_policy["epoch_valid_until"]:
-                        raise ApiError(
-                            E_MIGRATION_TARGET_INVALID,
-                            basis={"reason": "target_epoch_expired",
-                                   "policy_id": body.target_policy_id,
-                                   "version": body.target_version},
-                        )
-
-                    # 参数全部合法后再判“重复”：同 custody 的其他 open 会话，或已迁移完成。
-                    # 不同幂等键不得重复迁移。
-                    blocker = await conn.fetchrow(
-                        "SELECT id, status, new_custody_id FROM migration_sessions "
-                        "WHERE source_custody_id=$1 AND "
-                        "(status='open' OR new_custody_id IS NOT NULL) "
-                        "ORDER BY created_at DESC LIMIT 1",
-                        custody["id"],
-                    )
-                    if blocker is not None:
-                        if blocker["new_custody_id"] is not None:
-                            raise ApiError(
-                                E_MIGRATION_CONFLICT,
-                                basis={"reason": "custody_already_migrated",
-                                       "migration_id": blocker["id"],
-                                       "source_custody_id": custody["id"]},
-                            )
-                        raise ApiError(
-                            E_MIGRATION_CONFLICT,
-                            basis={"reason": "open_migration_exists_for_custody",
-                                   "migration_id": blocker["id"],
-                                   "source_custody_id": custody["id"]},
-                        )
+                    inputs = prepared[1]
 
                     # 回归闸门：全部预查（幂等键、源/目标有效性、同源在途/
-                    # 已完成拦截）均未命中之后、INSERT 之前（仅测试构建启用）。
-                    # 两个并发请求同键对“两条不同且有效的源记录”发起迁移时，
-                    # 源 custody 行锁互不重叠，可能双双通过预查——钉住该交错
-                    # 可验证后插入者撞 uq_migration_idem_open 后确定性 409、
-                    # 败方整体回滚并单独补拒绝审计；同处注入的 RAISE / 非目标
-                    # 约束 23505 则必须原样上抛，绝不能误判为幂等冲突。
+                    # 已完成拦截）均未命中之后、首次 INSERT 之前（仅测试构建启用）。
                     await faults.maybe_park(request, "migration.after_idem_check")
                     await faults.maybe_raise(request, "migration.after_idem_check")
 
-                    source_digest = _digest_of_policy(source_policy)
-                    target_digest = _digest_of_policy(target_policy)
                     migration_id = deps.new_id("mig")
                     # savepoint：唯一索引兜底命中后外层事务仍可用于留痕/返回。
                     # 有界重试：撞 uq_migration_idem_open 的胜方若在重读前已转入
                     # expired/failed/destroyed 终态，则键位已释放——终态行不充当
-                    # 赢家，按终态后重建规则重新校验创建（重试 INSERT）；连续
-                    # churn 耗尽重试则原样上抛最后一次违规，绝不误判。
+                    # 赢家，重建必须把请求当作“终态后新到”重新裁决：重新核对源
+                    # custody 与源/目标版本行（持目标版本行锁与撤销/轮换排先后），
+                    # 用新的 clock_timestamp() 复核有效期并重算摘要；目标已失效则
+                    # MIGRATION_TARGET_INVALID、不留会话/成功审计（拒绝由外层独立
+                    # 审计事务落库），全部有效才新建。连续 churn 耗尽重试则原样
+                    # 上抛最后一次违规，绝不误判。
                     replay_row = None
                     last_exc: asyncpg.UniqueViolationError | None = None
-                    for _attempt in range(3):
+                    for attempt in range(3):
                         try:
                             async with conn.transaction():
                                 await conn.execute(
@@ -494,13 +584,16 @@ async def start_migration(
                                        source_version, source_digest, target_policy_id,
                                        target_version, target_digest, idempotency_key_hash,
                                        status, valid_until)
-                                    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'open',
-                                            now() + ($11 || ' seconds')::interval)
+                                    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'open',$11)
                                     """,
-                                    migration_id, tenant["id"], custody["id"],
-                                    custody["policy_id"], custody["policy_version"], source_digest,
-                                    body.target_policy_id, body.target_version, target_digest,
-                                    idem_hash, str(ttl),
+                                    migration_id, tenant["id"],
+                                    inputs["custody"]["id"],
+                                    inputs["custody"]["policy_id"],
+                                    inputs["custody"]["policy_version"],
+                                    inputs["source_digest"],
+                                    body.target_policy_id, body.target_version,
+                                    inputs["target_digest"], idem_hash,
+                                    inputs["valid_until"],
                                 )
                         except asyncpg.UniqueViolationError as exc:
                             # 并发兜底：同键 open / 同源 open / 同源已完成都可能在此。
@@ -515,12 +608,28 @@ async def start_migration(
                                 exc=exc,
                                 tenant_id=tenant["id"],
                                 idem_hash=idem_hash,
-                                source_custody_id=custody["id"],
+                                source_custody_id=body.source_custody_id,
                                 target_policy_id=body.target_policy_id,
                                 target_version=body.target_version,
                             )
                             if replay_row is _RETRY_INSERT:
                                 replay_row = None
+                                # 终态后重建：按等待后的新状态完整重新裁决。
+                                revalidated = await _prepare_creation(lock_target=True)
+                                # 重建裁决后、重试 INSERT 之前的专用回归闸门：
+                                # 可钉住“重建与撤销/新赢家交错”，也可在该点注入
+                                # 非目标数据库错误（必须原样上抛，绝不翻译成目标
+                                # 失效或幂等冲突）。
+                                await faults.maybe_park(
+                                    request, "migration.after_rebuild_recheck")
+                                await faults.maybe_raise(
+                                    request, "migration.after_rebuild_recheck")
+                                if revalidated[0] == "existing":
+                                    # 等待期间出现了新的在途/完成赢家：交由循环外
+                                    # 的重放逻辑按“同请求重放 / 异请求冲突”裁决。
+                                    replay_row = revalidated[1]
+                                    break
+                                inputs = revalidated[1]
                                 continue
                             break
                         else:
@@ -530,8 +639,22 @@ async def start_migration(
                         # 连续重试仍撞索引（病态 churn）：原样上抛，绝不误判。
                         raise last_exc
                     if replay_row is not None:
-                        # 同键同请求的并发创建：胜方会话已提交，按幂等重放
-                        # 返回那同一份（200，不新建、不重复留痕）。
+                        # 同键同请求的并发创建（含重建等待期间出现的新赢家）：
+                        # 胜方会话已提交，按幂等重放返回那同一份（200，不新建、
+                        # 不重复留痕）。
+                        if (
+                            replay_row["source_custody_id"] != body.source_custody_id
+                            or replay_row["target_policy_id"] != body.target_policy_id
+                            or replay_row["target_version"] != body.target_version
+                        ):
+                            raise ApiError(
+                                E_IDEMPOTENCY_CONFLICT,
+                                basis={"reason": "concurrent_open_with_same_idempotency_key",
+                                       "idempotency_key_digest": idem_hash,
+                                       "migration_id": replay_row["id"],
+                                       "winner_source_custody_id":
+                                           replay_row["source_custody_id"]},
+                            )
                         count = await conn.fetchval(
                             "SELECT count(*) FROM migration_share_submissions WHERE migration_id=$1",
                             replay_row["id"],
@@ -548,19 +671,24 @@ async def start_migration(
                         out_count = count
                         out_new_digests = replay_digests
                         replayed = True
+                        source_threshold = (
+                            await repo.get_policy_version(
+                                conn, mig_row["source_policy_id"], mig_row["source_version"]
+                            )
+                        )["threshold"]
                     else:
                         await audit.append_audit(
                             conn, tenant_id=tenant["id"], actor_type="tenant",
                             actor_id=tenant["id"],
                             action="migration.start", resource=migration_id, result="ok",
                             basis={
-                                "source_custody_id": custody["id"],
-                                "source_policy_id": custody["policy_id"],
-                                "source_version": custody["policy_version"],
-                                "source_digest": source_digest,
+                                "source_custody_id": inputs["custody"]["id"],
+                                "source_policy_id": inputs["custody"]["policy_id"],
+                                "source_version": inputs["custody"]["policy_version"],
+                                "source_digest": inputs["source_digest"],
                                 "target_policy_id": body.target_policy_id,
                                 "target_version": body.target_version,
-                                "target_digest": target_digest,
+                                "target_digest": inputs["target_digest"],
                                 "ttl_seconds": ttl,
                                 "idempotency_key_digest": idem_hash,
                             },
@@ -569,7 +697,7 @@ async def start_migration(
                             "SELECT * FROM migration_sessions WHERE id=$1", migration_id
                         )
                         out_count, out_new_digests = 0, None
-                    source_threshold = source_policy["threshold"]
+                        source_threshold = inputs["source_policy"]["threshold"]
         except ApiError as exc:
             # 拒绝同样留痕（独立事务），形成可重放审计；不含任何秘密材料。
             await repo.audit_denied(
@@ -620,8 +748,16 @@ async def _resolve_unique_conflict(
       replay that winner (returns its row, HTTP 200); different source/target
       → deterministic 409 ``IDEMPOTENCY_CONFLICT``. A winner that has since
       reached a terminal state (``expired``/``failed``/``destroyed``) never
-      counts: the placeholder is free, so the caller re-validates the creation
-      under the post-terminal rebuild rules (bounded insert retry).
+      counts: the placeholder is free, so the caller returns
+      :data:`_RETRY_INSERT` and **re-adjudicates the creation from scratch** —
+      source custody and both policy version rows are re-read, the target
+      version row is locked ``FOR UPDATE`` to order the rebuild insert against
+      a concurrent policy revoke, validity/epoch windows are checked against a
+      fresh ``clock_timestamp()`` and the bound digests are recomputed. A
+      target that has meanwhile been revoked/expired therefore fails the
+      rebuild deterministically with ``MIGRATION_TARGET_INVALID`` (separate
+      denial audit, no session, no success audit) instead of creating an open
+      session pinned to a stale target and stale digests.
     * ``uq_migration_source_open`` / ``uq_migration_source_completed`` —
       another open / already-completed session for the same source custody →
       deterministic 409 ``MIGRATION_CONFLICT``.

@@ -75,8 +75,29 @@ Migration-session creation (v1.7, ``scripts.race_migration_start.py``) adds:
   (same body → 200 replay, different body → 409 ``IDEMPOTENCY_CONFLICT`` with
   a separate denial audit), and a winner that reached a terminal state
   (``expired``/``failed``/``destroyed``) must not win — the creation is
-  re-validated under the post-terminal rebuild rules instead of leaking the
-  raw database exception.
+  re-adjudicated as a post-terminal rebuild instead of leaking the raw
+  database exception.
+
+Post-terminal rebuild gates (v1.7.2):
+
+* ``migration.rebuild_target_locked`` — the loser's rebuild has re-read the
+  source custody/policy fresh and taken the **target policy-version row**
+  ``FOR UPDATE`` (to order the rebuild insert against a concurrent target
+  revoke), but the rebuild validity decision and the retried INSERT have not
+  happened yet. A real concurrent ``POST /policies/{id}/revoke`` parks on
+  this row lock; releasing the gate proves the rebuild insert and the revoke
+  commit in a deterministic order (no deadlock, no 500).
+* ``migration.after_rebuild_recheck`` — after the rebuild's fresh
+  re-validation (source/target versions, epoch windows against a fresh
+  ``clock_timestamp()``, recomputed digests) completed but before the retried
+  session INSERT. ``X-Fault-Fail: migration.after_rebuild_recheck:RAISE``
+  proves a non-target database failure at rebuild time propagates verbatim as
+  a 500 and is never translated into ``MIGRATION_TARGET_INVALID`` /
+  ``IDEMPOTENCY_CONFLICT``. Target revoke/expiry interleavings pinned around
+  these gates (S9–S14 in ``scripts.race_migration_start.py``) prove the
+  rebuild never reuses the transaction's pre-wait policy rows, digests or
+  frozen start time: an invalid target leaves no session, no success audit
+  and exactly one independent denial audit.
 
 Header protocol (only honored when fault injection is enabled):
 
